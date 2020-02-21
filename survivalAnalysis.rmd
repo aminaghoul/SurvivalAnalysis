@@ -1,0 +1,515 @@
+---
+title: "projet survival and longitudinal data analysis"
+author: "Amina Ghoul - Yamina Boubekeur - Daoued Karoui"
+date: "22/10/2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Introduction :
+
+Le but de ce projet est de prévoir la probabilité de rechute du cancer du sein (“recurrent”) à 24 mois. Pour cela, nous avons comparer les méthodes de l’analyse de survie (modèles de Cox, survival random forests) aux méthodes de classification (régression logistique, random forest).
+
+## Plan :
+
+Le plan de notre travail se décompose de la manière suivante: 
+
+1. Traitement des données
+2. Entrainement des diffèrents algorithmes de survie
+3. Entrainement des diffèrents algorithmes de classification
+4. Comparaison des algorithmes
+
+- Packages:
+
+```{r}
+library(KMsurv)
+library(survival)
+library(dplyr)
+library(survminer)
+library(ggplot2)
+library(ggfortify)
+library(survival)
+
+```
+
+- Import des données: 
+
+Chaque ligne du dataset étudié représente les données de suivies pour un cas de cancer du sein.
+
+```{r,warning=FALSE}
+DATA<-read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wpbc.data",header=F,sep=",")
+glimpse(DATA)
+```
+
+Ce jeu de données comprend 198 lignes et 35 variables.
+
+On remarque que sur la colonne V35, il y a des valeurs manquantes notées "?", qu'on va remplacer par la suite par "NA"
+ 
+```{r}
+rm(DATA)
+wpbc<-read.csv("https://archive.ics.uci.edu/ml/machine-learning-databases/breast-cancer-wisconsin/wpbc.data",header=F,sep=",",na="?")
+wpbc[,35]
+```
+ 
+- On renomme les variables à l'aide de la documentation fournie : 
+
+```{r}
+names_cov = paste0(rep(c('radius','texture','perimeter','area','smoothness','compactness',
+                         'concavity','concave_points','symmetry','fractal_dimension'),3),
+                   c(rep('_mean',10),rep('_SD',10),rep('_worst',10)))
+names(wpbc) = c('id','recurrent','time',names_cov,c('Tumor_size','Lymph_node_status'))
+
+```
+
+Les variables sont : **id** : l'identifiant de la patiente, **recurrent** : R=rechute, N=non rechute, **time** : temps de rechute si R, temps sans maladie si N, 
+10 variables réelles obtenues pour chaque noyau cellulaire : 
+**radius**, **texture**, **perimeter**,**area**, **smoothness**, **compactness**, **concavity**,**concave points**, **symmetry**, **fractal dimension**
+
+Pour chacune de ces variables, on a leur moyenne **_mean** , leur écart-type **_SD** , et la moyenne des 3 plus grandes valeurs **_worst**.
+
+**Tumor_size**: diamètre de la tumeur, **Lymph_node_status**: nombre de ganglions lymphatiques positifs 
+
+Ensuite on transforme _id_ en factor et _reccurent_ en factor TRUE =N et FALSE = R
+
+```{r}
+wpbc = wpbc %>% mutate(id = factor(id)) %>% 
+                mutate( recurrent = recode_factor(recurrent , "N" = TRUE, 'R' = FALSE )) 
+glimpse(wpbc)
+```
+
+- On transforme _time_ en numérique 
+
+```{r}
+wpbc = dplyr::mutate(wpbc,time=as.numeric(time))
+```
+
+- Gérer les NA: On remplace les "NA" par la médiane 
+
+```{r}
+library(tidyr)
+DATA_NA<-wpbc %>% replace_na(list(`Lymph_node_status`=median(wpbc$`Lymph_node_status`,na.rm =T)))
+sum(is.na(DATA_NA))
+```
+
+Il n'y a plus de données manquantes dans notre jeu de données.
+
+```{r}
+head(DATA_NA$perimeter_mean)
+```
+
+```{r}
+head(DATA_NA$concavity_mean)
+```
+
+On remarque que par exemple les valeurs des colonnes _perimeter_mean_ et _concavity_mean_ n'ont pas le même ordre de grandeur.
+Il faut alors, normaliser et centrer toutes les colonnes qui ont des valeurs numériques pour pouvoir les comparer entres elles.
+
+
+```{r}
+scale <- function(x)(x- mean(x,na.rm=T))/sd(x,na.rm=T)
+DATA_stan<- DATA_NA %>% mutate_at(names(DATA_NA)[-c(1,2,3)], scale)
+print(head(DATA_stan$perimeter_mean))
+print(head(DATA_stan$concavity_mean))
+```
+
+On s'interresse à la probabilité de rechute à 24 mois.
+
+On crée alors la variable de censure notée _Z_, il s'agit de la survenue ou non de l’évenement étudié, cette variable discréte _Z_ codée:
+
+- Z=1 si time <= 24 et recurrent = TRUE
+- Z=0 si time >24 et recurrent = TRUE ou recurrent = FALSE (i.e la donnée est censurée) 
+- Z=NA si time <=24 et recurrent = FALSE
+ 
+
+```{r}
+DATA_stan=DATA_stan %>%
+  mutate(Z=ifelse((time<=24)&(recurrent==TRUE),1,
+                  ifelse((time>24)&(recurrent==TRUE),0,
+                         ifelse((time>24)&(recurrent==FALSE),0,NA))))
+
+sum(is.na(DATA_stan$Z))
+dim(DATA_stan)
+```
+
+Il y a 29 valeurs manquantes, on supprime les lignes contenant les NA.
+
+```{r}
+data_class = dplyr::filter(DATA_stan,is.na(Z)==FALSE)
+data_class$Z = as.factor(data_class$Z)
+dim(data_class)
+```
+
+Il reste alors 169 lignes dans notre jeu de données.
+
+
+- On sépare le train et le test:
+
+L'échantillon d'entraînement est un sous-échantillon stratifié composé de 80% du dataset.
+
+L'échantillon de test est un sous-échantillon stratifié composé de 20% du dataset.
+
+Les échantilons train et test utilisés pour la classification contiennent la variable prédictive Z contrairement aux échantillons train et test utilisés pour les modèles de survie.
+
+```{r}
+library(caTools)
+library(caret)
+set.seed(42)
+
+data_class$recurrent=as.logical(data_class$recurrent)
+data_class= data_class %>% mutate(id_1n=c(1:nrow(data_class)))
+trainIndex = createDataPartition(data_class$recurrent, p=0.8, list=FALSE,times=1)
+
+# échantillons train et test pour la classification
+data_class_train <- data_class[trainIndex, ]
+data_class_test <-  data_class[-trainIndex, ]
+
+# échantillons train et test pour les modèles de survie
+data_class_train_surv=data_class_train %>% dplyr::select(-Z)
+data_class_test_surv=data_class_test %>% dplyr::select(-Z)
+
+```
+
+
+
+## Entrainement des diffèrents algorithmes de survie
+
+### Kaplan Meier
+
+L'estimation de la fonction de survie de **Kaplan-Meier** s’obtient avec la fonction _survfit {survival}_.
+
+```{r}
+#estimation de la fonction de survie
+km <- survfit(Surv(time, recurrent) ~ 1, data = data_class_train_surv)   
+summary(km)
+autoplot(km)   #représentation de la courbe de survie 
+```
+
+
+**Remarque:** 
+Un intervalle de confiance à 95%  de type ”log” calculé sur le log de la fonction de survie et qui donne une meilleure estimation de l’intervalle de confiance de la fonction de survie (représenté en gris). les traits verticaux sur la courbe représentent les individus censurés.
+
+On remarque que par exemple, la probabilité de rechute du cancer du sein à 27 mois est de 0.77192  et l'intervalle de confiance (CI = 0.70450 ,0.8458)
+
+### Modèle de Cox:
+
+Un modèle de Cox se calcule avec _coxph {survival}_
+
+- Entrainement sur le _train_ avec toutes les variables.
+
+
+```{r}
+library(MASS)
+cox_fit<-coxph(Surv(time, recurrent) ~. -id -id_1n, data=data_class_train_surv)
+summary(cox_fit)
+```
+
+la colonne _Coeff_ représente les coefficients de la regression et la colonne _exp(coeff)_ représente le risque proportionnel (hazard ratio)
+
+On remarque que de nombreuses variables ne sont pas significatives car $p>0.05$ pour un grand nombre de variables prises individuellement.
+
+Voyons si nous pouvons, avec la fonction _stepAIC {MASS} _, améliorer notre modèle par minimisation de _l’AIC_
+
+ - Amélioration du modèle : 
+ 
+```{r}
+cox_final = stepAIC(cox_fit,trace = F,direction = "backward")
+summary(cox_final)
+cox_final
+```
+
+En utilisant la méthode de sélection de variables backward, les variables explicatives qui expliquent le mieux notre modèle sont : texture_mean, symmetry_mean, texture_SD, perimeter_SD, area_SD, smoothness_SD, compactness_SD, concavity_SD , perimeter_worst, area_worst.
+
+On remarque bien que y a une nette amélioration au niveau des valeurs significatives et la p-value est passé de $p=4e-07$ à $7.015e-11$ pour le test du ratio du maximum  de vraissamblace.
+
+
+- Représentation des rapports de risque
+
+```{r}
+library(GGally)
+ggcoef(cox_final, exponentiate = TRUE)
+```
+
+Par exemple pour les variables _perimeter_worst_ et _area_SD_ plus leurs valeurs augmentes plus le risque de rechuter augmente , contrairement à, _perimeter_SD_ et _area_worst_ qui plus leurs valeurs diminues plus le risque de rechuter diminue
+ 
+
+- Prédiction sur le _test_
+
+```{r}
+pred_cox = survfit(cox_final)
+pred_cox$surv[24]
+```
+
+
+La fonction _survfit_ appliquée au modèle de Cox renvoie: les valeurs de la  fonction de survie conditionnelle estimée aux différents temps d’observation _survival_, la valeur de chaque covariable étant par défaut égale  à la valeur moyenne de la covariable _std.err_ et les intervalles de confiances à 95% _lower 95% CI_ et _upper 95% CI_
+
+Par exemple pour le temps time = 24mois la probabilité de rechute est égale à 0.754
+
+- Représentation du graphe de la fonction de survie
+
+On peut lire le résultat précédent sur le graphe suivant.
+
+```{r}
+plot(pred_cox, xlab = "Time", ylab="Survival", ylim = c(0,1), main="graphe de la fonction de survie" )
+
+```
+
+- Mesure de performance 
+
+```{r}
+pred_total =predict(cox_final)        #on effectue une prediction sur le data au complet
+pred_test=predict(cox_final,data_class_test_surv,type='risk')    #on effectue une prediction que sur le data_test
+Surv.rsp <- Surv(data_class_train_surv$time, data_class_train_surv$recurrent)
+Surv.rsp.new <- Surv(data_class_train_surv$time, data_class_train_surv$recurrent)
+```
+
+
+```{r}
+accuracies <- rep(0,5)  #liste qui contient les accuracy des algorithmes
+algorithmes <- rep('algo',5)  #liste qui contient les noms des algorithmes
+```
+
+```{r}
+library(survAUC)
+times <- seq(1,130,1)
+AUC_CD <- AUC.cd(Surv.rsp, Surv.rsp.new,pred_total, pred_test, times)
+accuracies[1]<-AUC_CD$iauc * 100
+algorithmes[1]<-'Cox'
+AUC_CD$iauc
+```
+
+On a une accuracy de 0.7798892.
+
+
+
+### Survival Random forest : 
+
+Le modèle de survival random forest se calcule avec _ranger {ranger}_
+
+- Entrainement sur le _train:
+
+```{r}
+library(ranger)
+
+ranger_model <- ranger(Surv(data_class_train_surv$time,data_class_train_surv$recurrent) ~.-id-id_1n,data=data_class_train_surv,num.trees = 500, probability=TRUE, importance = "permutation",seed = 1)
+# affiche les coefficients
+sort(ranger_model$variable.importance)
+```
+
+On observe que la variable la plus importante est concavity_mean et area_SD est la moins importante dans notre modèle.
+
+```{r}
+sapply(data.frame(ranger_model$survival),mean)[24]
+```
+
+La probabilité de rechute à 24 mois est égale à 0.6648
+
+ - Prédiction sur le test : 
+
+```{r}
+pred_rf=predict(ranger_model,data_class_test_surv)
+```
+
+ - AUC
+ 
+```{r}
+library(pROC)
+roc(response=((data_class_test_surv$recurrent)), predictor=1 - pred_rf$survival[,24])
+```
+
+L'AUC sur le test à 24 mois est de 0.7889
+
+```{r}
+accuracies[2]<-0.7889 *100
+algorithmes[2]<-'randf_surv'
+```
+## Classification : 
+
+### Regression logistique:
+ 
+```{r,warning=FALSE}
+library(caret)
+control <- trainControl(method="repeatedcv", number=5, repeats=3)
+fit.glm <- train(Z~.-id-id_1n, data=data_class_train, method="glm",trControl=control, metric="Accuracy")
+```
+
+ - Prédiction sur le **test** : 
+```{r}
+pred_glm = predict(fit.glm, newdata = data_class_test)
+
+```
+
+ - Matrice de confusion et accuracy **Régression Logistique**:
+ 
+```{r}
+MC_glm <- table(`Predicted Class`=pred_glm,`Actual Class`=data_class_test$Z)
+print(MC_glm)
+```
+
+```{r}
+accuracy <- function(x){sum(diag(x)/(sum(rowSums(x)))) * 100}
+acc_glm = accuracy(MC_glm)
+acc_glm
+```
+
+On remarque une accuracy sur le _test_ de 91%
+
+```{r}
+accuracies[3]<-acc_glm
+algorithmes[3]<-'reglog'
+```
+
+
+ - ROC : 
+
+```{r}
+library(pROC)
+pROC_obj <- roc(data_class_test$Z,as.numeric(pred_glm),
+            smoothed = TRUE,
+            # arguments for ci
+            ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+            # arguments for plot
+            plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+            print.auc=TRUE, show.thres=TRUE)
+
+
+sens.ci <- ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue")
+
+
+plot(sens.ci, type="bars")
+```
+ 
+
+### Random Forest :
+ 
+```{r}
+library(randomForest)
+set.seed(15)
+data_class_train$Z=as.factor(data_class_train$Z)
+rf.fit <- randomForest(Z~.-id-id_1n, data=data_class_train)
+```
+ 
+- Prédiction sur le **test**:
+
+```{r}
+pred_rf = predict(rf.fit, newdata = data_class_test)
+
+```
+
+- Matrice de confusion et accuracy **Random Forest**: 
+
+```{r}
+MC_rf <- table(`Predicted Class`=pred_rf,`Actual Class`=data_class_test$Z)
+```
+
+
+```{r}
+accuracy <- function(x){sum(diag(x)/(sum(rowSums(x)))) * 100}
+acc_rf=accuracy(MC_rf)
+acc_rf
+```
+
+On a une accuracy sur le **test** de 97%
+
+```{r}
+accuracies[4]<-acc_rf
+algorithmes[4]<-'Randfor_class'
+```
+
+
+
+- ROC:
+
+```{r}
+pROC_obj <- roc(data_class_test$Z,as.numeric(pred_rf),
+            smoothed = TRUE,
+            # arguments for ci
+            ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+            # arguments for plot
+            plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+            print.auc=TRUE, show.thres=TRUE)
+
+
+sens.ci <- ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue")
+
+
+plot(sens.ci, type="bars")
+```
+
+
+
+
+### Naive Bayes:
+
+
+- Entrainement sur le *train*: 
+
+```{r, warning=FALSE}
+library(e1071)
+set.seed(15)
+fit.NB <- naiveBayes(Z~.-id-id_1n , data = data_class_train,metric="accuracy")
+```
+
+- Prédiction sur le **test**:
+
+```{r}
+pred_NB = predict(fit.NB, newdata = data_class_test)
+```
+
+- Accuracy **Naïve Bayes** :
+
+```{r}
+MC_NB <- table(`Predicted Class`=pred_NB,`Actual Class`=data_class_test$Z)
+acc_BN <-accuracy(MC_NB)
+print(acc_BN)
+
+```
+
+On a une accuracy sur le **test** d'environ 76%
+
+```{r}
+accuracies[5]<-acc_BN
+algorithmes[5]<-'NaiveBayes'
+```
+
+
+```{r}
+pROC_obj <- roc(data_class_test$Z,as.numeric(pred_NB),
+            smoothed = TRUE,
+            # arguments for ci
+            ci=TRUE, ci.alpha=0.9, stratified=FALSE,
+            # arguments for plot
+            plot=TRUE, auc.polygon=TRUE, max.auc.polygon=TRUE, grid=TRUE,
+            print.auc=TRUE, show.thres=TRUE)
+
+
+sens.ci <- ci.se(pROC_obj)
+plot(sens.ci, type="shape", col="lightblue")
+
+
+plot(sens.ci, type="bars")
+
+```
+
+#### Comparaison des algorithmes:
+
+- Graphe de toutes les accuracy:
+
+On représente les accuracy de chaque algorithme en pourcentage.
+```{r}
+df_algo <- data.frame(accuracies,algorithmes)
+ggplot(df_algo, aes(x=algorithmes, y=accuracies, group=algorithmes)) + 
+  geom_point(aes( color=algorithmes,size=25))
+```
+
+
+
+
+## Conclusion : 
+
+En comparant les accuracies des différents modèles, on remarque que le meilleur modèle pour la prédiction est le modèle de random forest de classification.
+
+
+
